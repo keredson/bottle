@@ -370,7 +370,7 @@ class Router(object):
         if offset <= len(rule) or prefix:
             yield prefix + rule[offset:], None, None
 
-    def add(self, rule, method, target, name=None):
+    def add(self, rule, method, host, target, name=None):
         """ Add a new rule or replace the target for an existing rule. """
         anons = 0  # Number of anonymous wildcards found
         keys = []  # Names of keys
@@ -401,8 +401,9 @@ class Router(object):
         if name: self.builder[name] = builder
 
         if is_static and not self.strict_order:
-            self.static.setdefault(method, {})
-            self.static[method][self.build(rule)] = (target, None)
+            static_host = self.static.setdefault(host, {})
+            static_method = static_host.setdefault(method, {})
+            static_method[self.build(rule)] = (target, None)
             return
 
         try:
@@ -472,37 +473,43 @@ class Router(object):
         """ Return a (target, url_args) tuple or raise HTTPError(400/404/405). """
         verb = environ['REQUEST_METHOD'].upper()
         path = environ['PATH_INFO'] or '/'
+        host = environ['HOST'] or None
+        hosts = (None,) #(host, None) if host is not None and host in self.static else (None,)
+        
+        for host in hosts:
 
-        if verb == 'HEAD':
-            methods = ['PROXY', verb, 'GET', 'ANY']
-        else:
-            methods = ['PROXY', verb, 'ANY']
+            if verb == 'HEAD':
+                methods = ['PROXY', verb, 'GET', 'ANY']
+            else:
+                methods = ['PROXY', verb, 'ANY']
+                
+            static_host = self.static[host]
 
-        for method in methods:
-            if method in self.static and path in self.static[method]:
-                target, getargs = self.static[method][path]
-                return target, getargs(path) if getargs else {}
-            elif method in self.dyna_regexes:
+            for method in methods:
+                if method in static_host and path in static_host[method]:
+                    target, getargs = static_host[method][path]
+                    return target, getargs(path) if getargs else {}
+                elif method in self.dyna_regexes:
+                    for combined, rules in self.dyna_regexes[method]:
+                        match = combined(path)
+                        if match:
+                            target, getargs = rules[match.lastindex - 1]
+                            return target, getargs(path) if getargs else {}
+
+            # No matching route found. Collect alternative methods for 405 response
+            allowed = set([])
+            nocheck = set(methods)
+            for method in set(static_host) - nocheck:
+                if path in static_host[method]:
+                    allowed.add(verb)
+            for method in set(self.dyna_regexes) - allowed - nocheck:
                 for combined, rules in self.dyna_regexes[method]:
                     match = combined(path)
                     if match:
-                        target, getargs = rules[match.lastindex - 1]
-                        return target, getargs(path) if getargs else {}
-
-        # No matching route found. Collect alternative methods for 405 response
-        allowed = set([])
-        nocheck = set(methods)
-        for method in set(self.static) - nocheck:
-            if path in self.static[method]:
-                allowed.add(verb)
-        for method in set(self.dyna_regexes) - allowed - nocheck:
-            for combined, rules in self.dyna_regexes[method]:
-                match = combined(path)
-                if match:
-                    allowed.add(method)
-        if allowed:
-            allow_header = ",".join(sorted(allowed))
-            raise HTTPError(405, "Method not allowed.", Allow=allow_header)
+                        allowed.add(method)
+            if allowed:
+                allow_header = ",".join(sorted(allowed))
+                raise HTTPError(405, "Method not allowed.", Allow=allow_header)
 
         # No matching route and no alternative method found. We give up
         raise HTTPError(404, "Not found: " + repr(path))
@@ -517,11 +524,15 @@ class Route(object):
     def __init__(self, app, rule, method, callback,
                  name=None,
                  plugins=None,
-                 skiplist=None, **config):
+                 skiplist=None,
+                 host=None,
+                 **config):
         #: The application this route is installed to.
         self.app = app
         #: The path-rule string (e.g. ``/wiki/<page>``).
         self.rule = rule
+        #: The host string (e.g. ``www.example.com``).
+        self.host = host
         #: The HTTP method as a string (e.g. ``GET``).
         self.method = method
         #: The original callback with no plugins applied. Useful for introspection.
@@ -878,7 +889,7 @@ class Bottle(object):
         """ Add a route object, but do not change the :data:`Route.app`
             attribute."""
         self.routes.append(route)
-        self.router.add(route.rule, route.method, route, name=route.name)
+        self.router.add(route.rule, route.method, route.host, route, name=route.name)
         if DEBUG: route.prepare()
 
     def route(self,
@@ -887,7 +898,9 @@ class Bottle(object):
               callback=None,
               name=None,
               apply=None,
-              skip=None, **config):
+              skip=None, 
+              host=None,
+              **config):
         """ A decorator to bind a function to a request URL. Example::
 
                 @app.route('/hello/<name>')
@@ -925,7 +938,9 @@ class Bottle(object):
                     route = Route(self, rule, verb, callback,
                                   name=name,
                                   plugins=plugins,
-                                  skiplist=skiplist, **config)
+                                  skiplist=skiplist,
+                                  host=host,
+                                  **config)
                     self.add_route(route)
             return callback
 
